@@ -11,6 +11,7 @@
 #include <linux/uidgid.h>
 #include <linux/errno.h>
 #include <linux/spinlock.h>
+#include <linux/types.h>
 
 #ifndef __aarch64__
 #error "This module targets arm64 only"
@@ -145,14 +146,22 @@ static int perm_ret_handler(struct kretprobe_instance *ri,
 			    struct pt_regs *regs)
 {
 	struct hide_data *data = (struct hide_data *)ri->data;
-	long orig = (long)regs->regs[0];
+	u32 raw;
+	long orig;
 
-	if (data->hide) {
-		pr_info("hide_dd: ret orig=%ld comm=%s\n", orig, current->comm);
-		if (orig < 0) {
-			regs->regs[0] = (unsigned long)(-ENOENT);
-			pr_info("hide_dd: rewrote %ld -> -ENOENT\n", orig);
-		}
+	if (!data->hide)
+		return 0;
+
+	raw  = (u32)regs->regs[0];
+	orig = (long)(s32)raw;
+
+	if (debug_verbose)
+		pr_info("hide_dd: ret raw=0x%08x orig=%ld comm=%s\n",
+			raw, orig, current->comm);
+
+	if (orig < 0) {
+		regs->regs[0] = (unsigned long)(long)(s32)(-ENOENT);
+		pr_info("hide_dd: rewrote %ld -> -ENOENT\n", orig);
 	}
 
 	return 0;
@@ -246,4 +255,4 @@ module_exit(hide_dd_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Hide /data/data/<other_uid> from app processes");
-MODULE_VERSION("2.4");
+MODULE_VERSION("2.5");
