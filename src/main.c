@@ -20,7 +20,7 @@
 #define APP_UID_MAX 19999
 #define DENTRY_WALK_MAX 16
 
-static bool debug_verbose = true;
+static bool debug_verbose = false;
 module_param(debug_verbose, bool, 0644);
 
 static DEFINE_XARRAY(hide_dd_guard_xa);
