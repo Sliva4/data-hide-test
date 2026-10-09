@@ -10,7 +10,6 @@
 #include <linux/cred.h>
 #include <linux/uidgid.h>
 #include <linux/errno.h>
-#include <linux/xarray.h>
 #include <linux/spinlock.h>
 
 #ifndef __aarch64__
@@ -20,27 +19,10 @@
 #define APP_UID_MIN 10000
 #define APP_UID_MAX 19999
 
-static bool debug_verbose = true;
+static bool debug_verbose = false;
 module_param(debug_verbose, bool, 0644);
 
 static struct super_block *data_sb;
-static DEFINE_XARRAY(hide_dd_guard_xa);
-
-static bool hide_dd_guard_enter(void)
-{
-	void *old;
-
-	if (xa_load(&hide_dd_guard_xa, (unsigned long)current))
-		return false;
-	old = xa_store(&hide_dd_guard_xa, (unsigned long)current,
-		       current, GFP_ATOMIC);
-	return !IS_ERR(old);
-}
-
-static void hide_dd_guard_exit(void)
-{
-	xa_erase(&hide_dd_guard_xa, (unsigned long)current);
-}
 
 static inline bool is_app_uid(kuid_t uid)
 {
@@ -103,7 +85,7 @@ static bool is_foreign_pkg_dir(struct inode *inode)
 {
 	kuid_t caller, owner;
 	struct dentry *d;
-	bool ret = false;
+	bool ret;
 
 	if (!inode)
 		return false;
@@ -128,11 +110,6 @@ static bool is_foreign_pkg_dir(struct inode *inode)
 
 	ret = is_under_data_data(d);
 	dput(d);
-
-	if (ret && debug_verbose)
-		pr_info("hide_dd: MATCH-DD ino_uid=%u caller=%u\n",
-			__kuid_val(owner), __kuid_val(caller));
-
 	return ret;
 }
 
@@ -148,25 +125,17 @@ static int perm_entry_handler(struct kretprobe_instance *ri,
 
 	data->hide = false;
 
-	if (!hide_dd_guard_enter())
-		return 0;
-
 	inode = (struct inode *)regs->regs[1];
-
-	if (debug_verbose && inode) {
-		pr_info("hide_dd: perm caller=%u ino_uid=%u mode=0%o comm=%s\n",
-			__kuid_val(current_fsuid()),
-			__kuid_val(inode->i_uid),
-			inode->i_mode & S_IFMT,
-			current->comm);
-	}
+	if (!inode)
+		return 0;
 
 	if (is_foreign_pkg_dir(inode)) {
 		data->hide = true;
-		pr_info("hide_dd: HIDE ino_uid=%u caller=%u comm=%s\n",
-			__kuid_val(inode->i_uid),
-			__kuid_val(current_fsuid()),
-			current->comm);
+		if (debug_verbose)
+			pr_info("hide_dd: HIDE ino_uid=%u caller=%u comm=%s\n",
+				__kuid_val(inode->i_uid),
+				__kuid_val(current_fsuid()),
+				current->comm);
 	}
 
 	return 0;
@@ -179,15 +148,13 @@ static int perm_ret_handler(struct kretprobe_instance *ri,
 	long orig = (long)regs->regs[0];
 
 	if (data->hide) {
-		if (orig == -EPERM || orig == -EACCES) {
+		pr_info("hide_dd: ret orig=%ld comm=%s\n", orig, current->comm);
+		if (orig < 0) {
 			regs->regs[0] = (unsigned long)(-ENOENT);
 			pr_info("hide_dd: rewrote %ld -> -ENOENT\n", orig);
-		} else if (debug_verbose) {
-			pr_info("hide_dd: ret orig=%ld (not rewritten)\n", orig);
 		}
 	}
 
-	hide_dd_guard_exit();
 	return 0;
 }
 
@@ -196,7 +163,7 @@ static struct kretprobe perm_krp = {
 	.entry_handler  = perm_entry_handler,
 	.handler        = perm_ret_handler,
 	.data_size      = sizeof(struct hide_data),
-	.maxactive      = 512,
+	.maxactive      = 4096,
 };
 
 static int save_data_sb(void)
@@ -279,4 +246,4 @@ module_exit(hide_dd_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Hide /data/data/<other_uid> from app processes");
-MODULE_VERSION("2.3");
+MODULE_VERSION("2.4");
