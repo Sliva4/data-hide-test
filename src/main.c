@@ -132,6 +132,13 @@ static bool is_foreign_pkg_dir(struct inode *inode)
 	return ret;
 }
 
+static bool is_foreign_pkg_path(const struct path *path)
+{
+	if (!path || !path->dentry)
+		return false;
+	return is_foreign_pkg_dir(d_inode(path->dentry));
+}
+
 struct hide_data {
 	bool hide;
 };
@@ -150,7 +157,7 @@ static int perm_entry_handler(struct kretprobe_instance *ri,
 	if (is_foreign_pkg_dir(inode)) {
 		data->hide = true;
 		if (debug_verbose)
-			pr_info("hide_dd: PERM-HIDE ino_uid=%u caller=%u comm=%s\n",
+			pr_info("hide_dd: PERM-HIDE uid=%u caller=%u comm=%s\n",
 				__kuid_val(inode->i_uid),
 				__kuid_val(current_fsuid()),
 				current->comm);
@@ -180,6 +187,49 @@ static struct kretprobe perm_krp = {
 	.maxactive      = 8192,
 };
 
+/* ============ security_inode_getattr ============ */
+
+static int sec_getattr_entry_handler(struct kretprobe_instance *ri,
+				     struct pt_regs *regs)
+{
+	struct hide_data *data = (struct hide_data *)ri->data;
+	const struct path *path;
+
+	data->hide = false;
+	path = (const struct path *)regs->regs[0];
+
+	if (is_foreign_pkg_path(path)) {
+		data->hide = true;
+		if (debug_verbose)
+			pr_info("hide_dd: SEC-HIDE caller=%u comm=%s\n",
+				__kuid_val(current_fsuid()),
+				current->comm);
+	}
+	return 0;
+}
+
+static int sec_getattr_ret_handler(struct kretprobe_instance *ri,
+				   struct pt_regs *regs)
+{
+	struct hide_data *data = (struct hide_data *)ri->data;
+
+	if (data->hide) {
+		regs->regs[0] = (unsigned long)(long)(s32)(-ENOENT);
+		if (debug_verbose)
+			pr_info("hide_dd: SEC -> -ENOENT comm=%s\n",
+				current->comm);
+	}
+	return 0;
+}
+
+static struct kretprobe sec_getattr_krp = {
+	.kp.symbol_name = "security_inode_getattr",
+	.entry_handler  = sec_getattr_entry_handler,
+	.handler        = sec_getattr_ret_handler,
+	.data_size      = sizeof(struct hide_data),
+	.maxactive      = 8192,
+};
+
 /* ============ vfs_getattr / vfs_getattr_nosec ============ */
 
 static int getattr_entry_handler(struct kretprobe_instance *ri,
@@ -187,19 +237,14 @@ static int getattr_entry_handler(struct kretprobe_instance *ri,
 {
 	struct hide_data *data = (struct hide_data *)ri->data;
 	const struct path *path;
-	struct inode *inode;
 
 	data->hide = false;
 	path = (const struct path *)regs->regs[0];
-	if (!path || !path->dentry)
-		return 0;
 
-	inode = d_inode(path->dentry);
-	if (is_foreign_pkg_dir(inode)) {
+	if (is_foreign_pkg_path(path)) {
 		data->hide = true;
 		if (debug_verbose)
-			pr_info("hide_dd: GETATTR-HIDE ino_uid=%u caller=%u comm=%s\n",
-				__kuid_val(inode->i_uid),
+			pr_info("hide_dd: GETATTR-HIDE caller=%u comm=%s\n",
 				__kuid_val(current_fsuid()),
 				current->comm);
 	}
@@ -251,12 +296,9 @@ static int register_kret(struct kretprobe *krp, const char *name)
 		return 0;
 	}
 
-	pr_info("hide_dd: %s symbol-based failed (%d), trying addr\n",
-		name, ret);
-
 	addr = kallsyms_lookup_name(name);
 	if (!addr) {
-		pr_err("hide_dd: %s not found\n", name);
+		pr_warn("hide_dd: %s not found\n", name);
 		return -ENOENT;
 	}
 
@@ -267,8 +309,7 @@ static int register_kret(struct kretprobe *krp, const char *name)
 		pr_info("hide_dd: kretprobe on %s @ 0x%lx\n", name, addr);
 		return 0;
 	}
-
-	pr_err("hide_dd: %s addr-based failed (%d)\n", name, ret);
+	pr_warn("hide_dd: %s addr-based failed (%d)\n", name, ret);
 	return ret;
 }
 
@@ -282,7 +323,6 @@ static int save_data_sb(void)
 		pr_err("hide_dd: kern_path(/data) failed: %d\n", ret);
 		return ret;
 	}
-
 	data_sb = path.dentry->d_sb;
 	pr_info("hide_dd: /data sb=%p s_root=%p\n",
 		data_sb, data_sb->s_root);
@@ -299,6 +339,7 @@ static int __init hide_dd_init(void)
 		return ret;
 
 	register_kret(&perm_krp, "inode_permission");
+	register_kret(&sec_getattr_krp, "security_inode_getattr");
 	register_kret(&getattr_krp, "vfs_getattr");
 	register_kret(&getattr_nosec_krp, "vfs_getattr_nosec");
 
@@ -310,6 +351,7 @@ static void __exit hide_dd_exit(void)
 {
 	unregister_kretprobe(&getattr_nosec_krp);
 	unregister_kretprobe(&getattr_krp);
+	unregister_kretprobe(&sec_getattr_krp);
 	unregister_kretprobe(&perm_krp);
 	pr_info("hide_dd: unloaded\n");
 }
@@ -319,5 +361,4 @@ module_exit(hide_dd_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Hide /data/data/<other_uid> from app processes");
-MODULE_AUTHOR("anon");
-MODULE_VERSION("3.5");
+MODULE_VERSION("4.0");
