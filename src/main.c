@@ -118,6 +118,8 @@ struct hide_data {
 	bool hide;
 };
 
+/* ---------------- inode_permission ---------------- */
+
 static int perm_entry_handler(struct kretprobe_instance *ri,
 			      struct pt_regs *regs)
 {
@@ -127,18 +129,14 @@ static int perm_entry_handler(struct kretprobe_instance *ri,
 	data->hide = false;
 
 	inode = (struct inode *)regs->regs[1];
-	if (!inode)
-		return 0;
-
 	if (is_foreign_pkg_dir(inode)) {
 		data->hide = true;
 		if (debug_verbose)
-			pr_info("hide_dd: HIDE ino_uid=%u caller=%u comm=%s\n",
+			pr_info("hide_dd: PERM-HIDE ino_uid=%u caller=%u comm=%s\n",
 				__kuid_val(inode->i_uid),
 				__kuid_val(current_fsuid()),
 				current->comm);
 	}
-
 	return 0;
 }
 
@@ -146,24 +144,13 @@ static int perm_ret_handler(struct kretprobe_instance *ri,
 			    struct pt_regs *regs)
 {
 	struct hide_data *data = (struct hide_data *)ri->data;
-	u32 raw;
-	long orig;
 
-	if (!data->hide)
-		return 0;
-
-	raw  = (u32)regs->regs[0];
-	orig = (long)(s32)raw;
-
-	if (debug_verbose)
-		pr_info("hide_dd: ret raw=0x%08x orig=%ld comm=%s\n",
-			raw, orig, current->comm);
-
-	if (orig < 0) {
+	if (data->hide) {
 		regs->regs[0] = (unsigned long)(long)(s32)(-ENOENT);
-		pr_info("hide_dd: rewrote %ld -> -ENOENT\n", orig);
+		if (debug_verbose)
+			pr_info("hide_dd: perm -> -ENOENT comm=%s\n",
+				current->comm);
 	}
-
 	return 0;
 }
 
@@ -174,6 +161,90 @@ static struct kretprobe perm_krp = {
 	.data_size      = sizeof(struct hide_data),
 	.maxactive      = 4096,
 };
+
+/* ---------------- vfs_getattr ---------------- */
+
+static int getattr_entry_handler(struct kretprobe_instance *ri,
+				 struct pt_regs *regs)
+{
+	struct hide_data *data = (struct hide_data *)ri->data;
+	const struct path *path;
+	struct inode *inode;
+
+	data->hide = false;
+
+	path = (const struct path *)regs->regs[0];
+	if (!path || !path->dentry)
+		return 0;
+
+	inode = d_inode(path->dentry);
+	if (is_foreign_pkg_dir(inode)) {
+		data->hide = true;
+		if (debug_verbose)
+			pr_info("hide_dd: GETATTR-HIDE ino_uid=%u caller=%u comm=%s\n",
+				__kuid_val(inode->i_uid),
+				__kuid_val(current_fsuid()),
+				current->comm);
+	}
+	return 0;
+}
+
+static int getattr_ret_handler(struct kretprobe_instance *ri,
+			       struct pt_regs *regs)
+{
+	struct hide_data *data = (struct hide_data *)ri->data;
+
+	if (data->hide) {
+		regs->regs[0] = (unsigned long)(long)(s32)(-ENOENT);
+		if (debug_verbose)
+			pr_info("hide_dd: getattr -> -ENOENT comm=%s\n",
+				current->comm);
+	}
+	return 0;
+}
+
+static struct kretprobe getattr_krp = {
+	.kp.symbol_name = "vfs_getattr",
+	.entry_handler  = getattr_entry_handler,
+	.handler        = getattr_ret_handler,
+	.data_size      = sizeof(struct hide_data),
+	.maxactive      = 4096,
+};
+
+/* ---------------- registration ---------------- */
+
+static int register_one(struct kretprobe *krp, const char *name)
+{
+	int ret;
+	unsigned long addr;
+
+	krp->kp.symbol_name = name;
+	krp->kp.addr = NULL;
+	ret = register_kretprobe(krp);
+	if (ret == 0) {
+		pr_info("hide_dd: kretprobe on %s\n", name);
+		return 0;
+	}
+
+	pr_info("hide_dd: %s symbol-based failed (%d), trying addr\n",
+		name, ret);
+
+	addr = kallsyms_lookup_name(name);
+	if (!addr) {
+		pr_err("hide_dd: %s not found\n", name);
+		return -ENOENT;
+	}
+
+	krp->kp.symbol_name = NULL;
+	krp->kp.addr = (kprobe_opcode_t *)addr;
+	ret = register_kretprobe(krp);
+	if (ret == 0) {
+		pr_info("hide_dd: kretprobe on %s @ 0x%lx\n", name, addr);
+		return 0;
+	}
+	pr_err("hide_dd: %s addr-based failed (%d)\n", name, ret);
+	return ret;
+}
 
 static int save_data_sb(void)
 {
@@ -193,39 +264,6 @@ static int save_data_sb(void)
 	return 0;
 }
 
-static int hide_dd_register(void)
-{
-	int ret;
-	unsigned long addr;
-
-	perm_krp.kp.symbol_name = "inode_permission";
-	perm_krp.kp.addr = NULL;
-	ret = register_kretprobe(&perm_krp);
-	if (ret == 0) {
-		pr_info("hide_dd: kretprobe on inode_permission\n");
-		return 0;
-	}
-
-	pr_info("hide_dd: symbol-based failed (%d), trying addr\n", ret);
-
-	addr = kallsyms_lookup_name("inode_permission");
-	if (!addr) {
-		pr_err("hide_dd: inode_permission not found\n");
-		return -ENOENT;
-	}
-
-	perm_krp.kp.symbol_name = NULL;
-	perm_krp.kp.addr = (kprobe_opcode_t *)addr;
-	ret = register_kretprobe(&perm_krp);
-	if (ret == 0) {
-		pr_info("hide_dd: kretprobe on inode_permission @ 0x%lx\n", addr);
-		return 0;
-	}
-
-	pr_err("hide_dd: addr-based failed (%d)\n", ret);
-	return ret;
-}
-
 static int __init hide_dd_init(void)
 {
 	int ret;
@@ -234,9 +272,13 @@ static int __init hide_dd_init(void)
 	if (ret)
 		return ret;
 
-	ret = hide_dd_register();
-	if (ret < 0) {
-		pr_err("hide_dd: register_kretprobe failed: %d\n", ret);
+	ret = register_one(&perm_krp, "inode_permission");
+	if (ret)
+		return ret;
+
+	ret = register_one(&getattr_krp, "vfs_getattr");
+	if (ret) {
+		unregister_kretprobe(&perm_krp);
 		return ret;
 	}
 
@@ -246,6 +288,7 @@ static int __init hide_dd_init(void)
 
 static void __exit hide_dd_exit(void)
 {
+	unregister_kretprobe(&getattr_krp);
 	unregister_kretprobe(&perm_krp);
 	pr_info("hide_dd: unloaded\n");
 }
@@ -255,4 +298,4 @@ module_exit(hide_dd_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Hide /data/data/<other_uid> from app processes");
-MODULE_VERSION("2.5");
+MODULE_VERSION("3.0");
