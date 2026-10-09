@@ -129,13 +129,20 @@ static int perm_entry_handler(struct kretprobe_instance *ri,
 	data->hide = false;
 
 	inode = (struct inode *)regs->regs[1];
+
+	if (debug_verbose && inode)
+		pr_info("hide_dd: perm caller=%u ino_uid=%u mode=0%o comm=%s\n",
+			__kuid_val(current_fsuid()),
+			__kuid_val(inode->i_uid),
+			inode->i_mode & S_IFMT,
+			current->comm);
+
 	if (is_foreign_pkg_dir(inode)) {
 		data->hide = true;
-		if (debug_verbose)
-			pr_info("hide_dd: PERM-HIDE ino_uid=%u caller=%u comm=%s\n",
-				__kuid_val(inode->i_uid),
-				__kuid_val(current_fsuid()),
-				current->comm);
+		pr_info("hide_dd: PERM-HIDE ino_uid=%u caller=%u comm=%s\n",
+			__kuid_val(inode->i_uid),
+			__kuid_val(current_fsuid()),
+			current->comm);
 	}
 	return 0;
 }
@@ -147,9 +154,7 @@ static int perm_ret_handler(struct kretprobe_instance *ri,
 
 	if (data->hide) {
 		regs->regs[0] = (unsigned long)(long)(s32)(-ENOENT);
-		if (debug_verbose)
-			pr_info("hide_dd: perm -> -ENOENT comm=%s\n",
-				current->comm);
+		pr_info("hide_dd: PERM -> -ENOENT comm=%s\n", current->comm);
 	}
 	return 0;
 }
@@ -180,11 +185,10 @@ static int getattr_entry_handler(struct kretprobe_instance *ri,
 	inode = d_inode(path->dentry);
 	if (is_foreign_pkg_dir(inode)) {
 		data->hide = true;
-		if (debug_verbose)
-			pr_info("hide_dd: GETATTR-HIDE ino_uid=%u caller=%u comm=%s\n",
-				__kuid_val(inode->i_uid),
-				__kuid_val(current_fsuid()),
-				current->comm);
+		pr_info("hide_dd: GETATTR-HIDE ino_uid=%u caller=%u comm=%s\n",
+			__kuid_val(inode->i_uid),
+			__kuid_val(current_fsuid()),
+			current->comm);
 	}
 	return 0;
 }
@@ -196,15 +200,23 @@ static int getattr_ret_handler(struct kretprobe_instance *ri,
 
 	if (data->hide) {
 		regs->regs[0] = (unsigned long)(long)(s32)(-ENOENT);
-		if (debug_verbose)
-			pr_info("hide_dd: getattr -> -ENOENT comm=%s\n",
-				current->comm);
+		pr_info("hide_dd: GETATTR -> -ENOENT comm=%s\n", current->comm);
 	}
 	return 0;
 }
 
 static struct kretprobe getattr_krp = {
 	.kp.symbol_name = "vfs_getattr",
+	.entry_handler  = getattr_entry_handler,
+	.handler        = getattr_ret_handler,
+	.data_size      = sizeof(struct hide_data),
+	.maxactive      = 4096,
+};
+
+/* ---------------- vfs_getattr_nosec (fallback) ---------------- */
+
+static struct kretprobe getattr_nosec_krp = {
+	.kp.symbol_name = "vfs_getattr_nosec",
 	.entry_handler  = getattr_entry_handler,
 	.handler        = getattr_ret_handler,
 	.data_size      = sizeof(struct hide_data),
@@ -277,10 +289,12 @@ static int __init hide_dd_init(void)
 		return ret;
 
 	ret = register_one(&getattr_krp, "vfs_getattr");
-	if (ret) {
-		unregister_kretprobe(&perm_krp);
-		return ret;
-	}
+	if (ret)
+		pr_warn("hide_dd: vfs_getattr hook failed, trying nosec\n");
+
+	ret = register_one(&getattr_nosec_krp, "vfs_getattr_nosec");
+	if (ret)
+		pr_warn("hide_dd: vfs_getattr_nosec hook failed\n");
 
 	pr_info("hide_dd: loaded (uid %d..%d)\n", APP_UID_MIN, APP_UID_MAX);
 	return 0;
@@ -288,6 +302,7 @@ static int __init hide_dd_init(void)
 
 static void __exit hide_dd_exit(void)
 {
+	unregister_kretprobe(&getattr_nosec_krp);
 	unregister_kretprobe(&getattr_krp);
 	unregister_kretprobe(&perm_krp);
 	pr_info("hide_dd: unloaded\n");
@@ -298,4 +313,4 @@ module_exit(hide_dd_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Hide /data/data/<other_uid> from app processes");
-MODULE_VERSION("3.0");
+MODULE_VERSION("3.1");
