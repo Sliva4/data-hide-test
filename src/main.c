@@ -19,6 +19,7 @@
 
 #define APP_UID_MIN 10000
 #define APP_UID_MAX 19999
+#define WALK_MAX_DEPTH 12
 
 static bool debug_verbose = false;
 module_param(debug_verbose, bool, 0644);
@@ -43,13 +44,13 @@ static struct dentry *inode_first_dentry(struct inode *inode)
 			lockref_get_not_dead(&dentry->d_lockref);
 	}
 	spin_unlock(&inode->i_lock);
-
 	return dentry;
 }
 
 static bool is_under_data_data(struct dentry *d)
 {
-	struct dentry *p, *pp;
+	struct dentry *cur = d;
+	int depth;
 
 	if (!data_sb || !d)
 		return false;
@@ -57,28 +58,47 @@ static bool is_under_data_data(struct dentry *d)
 	if (d->d_sb != data_sb)
 		return false;
 
-	p = d->d_parent;
-	if (!p || p == d)
-		return false;
+	for (depth = 0; depth < WALK_MAX_DEPTH; depth++) {
+		struct dentry *p = cur->d_parent;
 
-	if (p->d_name.len == 4 &&
-	    memcmp(p->d_name.name, "data", 4) == 0) {
-		pp = p->d_parent;
-		if (pp && pp == data_sb->s_root)
-			return true;
-	}
+		if (!p || p == cur)
+			return false;
 
-	if (p->d_name.len == 1 &&
-	    p->d_name.name[0] >= '0' && p->d_name.name[0] <= '9') {
-		struct dentry *user_d = p->d_parent;
+		if (p->d_name.len == 4 &&
+		    memcmp(p->d_name.name, "data", 4) == 0) {
+			struct dentry *pp = p->d_parent;
 
-		if (user_d && user_d->d_name.len == 4 &&
-		    memcmp(user_d->d_name.name, "user", 4) == 0) {
-			if (user_d->d_parent == data_sb->s_root)
+			if (p->d_parent == p)
+				return true;
+
+			if (pp && pp == data_sb->s_root)
+				return true;
+
+			if (pp && pp->d_name.len == 4 &&
+			    memcmp(pp->d_name.name, "data", 4) == 0)
 				return true;
 		}
-	}
 
+		if (p->d_name.len == 1 &&
+		    p->d_name.name[0] >= '0' && p->d_name.name[0] <= '9') {
+			struct dentry *ud = p->d_parent;
+
+			if (ud && ud->d_name.len == 4 &&
+			    memcmp(ud->d_name.name, "user", 4) == 0) {
+				struct dentry *up = ud->d_parent;
+
+				if (ud->d_parent == ud)
+					return true;
+				if (up && up == data_sb->s_root)
+					return true;
+				if (up && up->d_name.len == 4 &&
+				    memcmp(up->d_name.name, "data", 4) == 0)
+					return true;
+			}
+		}
+
+		cur = p;
+	}
 	return false;
 }
 
@@ -114,28 +134,15 @@ static bool is_foreign_pkg_dir(struct inode *inode)
 	return ret;
 }
 
-struct hide_data {
-	bool hide;
-};
+struct hide_data { bool hide; };
 
-/* ---------------- inode_permission ---------------- */
-
-static int perm_entry_handler(struct kretprobe_instance *ri,
-			      struct pt_regs *regs)
+static int perm_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct hide_data *data = (struct hide_data *)ri->data;
 	struct inode *inode;
 
 	data->hide = false;
-
 	inode = (struct inode *)regs->regs[1];
-
-	if (debug_verbose && inode)
-		pr_info("hide_dd: perm caller=%u ino_uid=%u mode=0%o comm=%s\n",
-			__kuid_val(current_fsuid()),
-			__kuid_val(inode->i_uid),
-			inode->i_mode & S_IFMT,
-			current->comm);
 
 	if (is_foreign_pkg_dir(inode)) {
 		data->hide = true;
@@ -147,11 +154,9 @@ static int perm_entry_handler(struct kretprobe_instance *ri,
 	return 0;
 }
 
-static int perm_ret_handler(struct kretprobe_instance *ri,
-			    struct pt_regs *regs)
+static int perm_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct hide_data *data = (struct hide_data *)ri->data;
-
 	if (data->hide) {
 		regs->regs[0] = (unsigned long)(long)(s32)(-ENOENT);
 		pr_info("hide_dd: PERM -> -ENOENT comm=%s\n", current->comm);
@@ -164,20 +169,16 @@ static struct kretprobe perm_krp = {
 	.entry_handler  = perm_entry_handler,
 	.handler        = perm_ret_handler,
 	.data_size      = sizeof(struct hide_data),
-	.maxactive      = 4096,
+	.maxactive      = 8192,
 };
 
-/* ---------------- vfs_getattr ---------------- */
-
-static int getattr_entry_handler(struct kretprobe_instance *ri,
-				 struct pt_regs *regs)
+static int getattr_entry_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct hide_data *data = (struct hide_data *)ri->data;
 	const struct path *path;
 	struct inode *inode;
 
 	data->hide = false;
-
 	path = (const struct path *)regs->regs[0];
 	if (!path || !path->dentry)
 		return 0;
@@ -193,11 +194,9 @@ static int getattr_entry_handler(struct kretprobe_instance *ri,
 	return 0;
 }
 
-static int getattr_ret_handler(struct kretprobe_instance *ri,
-			       struct pt_regs *regs)
+static int getattr_ret_handler(struct kretprobe_instance *ri, struct pt_regs *regs)
 {
 	struct hide_data *data = (struct hide_data *)ri->data;
-
 	if (data->hide) {
 		regs->regs[0] = (unsigned long)(long)(s32)(-ENOENT);
 		pr_info("hide_dd: GETATTR -> -ENOENT comm=%s\n", current->comm);
@@ -210,22 +209,10 @@ static struct kretprobe getattr_krp = {
 	.entry_handler  = getattr_entry_handler,
 	.handler        = getattr_ret_handler,
 	.data_size      = sizeof(struct hide_data),
-	.maxactive      = 4096,
+	.maxactive      = 8192,
 };
 
-/* ---------------- vfs_getattr_nosec (fallback) ---------------- */
-
-static struct kretprobe getattr_nosec_krp = {
-	.kp.symbol_name = "vfs_getattr_nosec",
-	.entry_handler  = getattr_entry_handler,
-	.handler        = getattr_ret_handler,
-	.data_size      = sizeof(struct hide_data),
-	.maxactive      = 4096,
-};
-
-/* ---------------- registration ---------------- */
-
-static int register_one(struct kretprobe *krp, const char *name)
+static int register_kret(struct kretprobe *krp, const char *name)
 {
 	int ret;
 	unsigned long addr;
@@ -238,14 +225,9 @@ static int register_one(struct kretprobe *krp, const char *name)
 		return 0;
 	}
 
-	pr_info("hide_dd: %s symbol-based failed (%d), trying addr\n",
-		name, ret);
-
 	addr = kallsyms_lookup_name(name);
-	if (!addr) {
-		pr_err("hide_dd: %s not found\n", name);
+	if (!addr)
 		return -ENOENT;
-	}
 
 	krp->kp.symbol_name = NULL;
 	krp->kp.addr = (kprobe_opcode_t *)addr;
@@ -254,7 +236,6 @@ static int register_one(struct kretprobe *krp, const char *name)
 		pr_info("hide_dd: kretprobe on %s @ 0x%lx\n", name, addr);
 		return 0;
 	}
-	pr_err("hide_dd: %s addr-based failed (%d)\n", name, ret);
 	return ret;
 }
 
@@ -268,7 +249,6 @@ static int save_data_sb(void)
 		pr_err("hide_dd: kern_path(/data) failed: %d\n", ret);
 		return ret;
 	}
-
 	data_sb = path.dentry->d_sb;
 	pr_info("hide_dd: /data sb=%p s_root=%p\n",
 		data_sb, data_sb->s_root);
@@ -284,17 +264,8 @@ static int __init hide_dd_init(void)
 	if (ret)
 		return ret;
 
-	ret = register_one(&perm_krp, "inode_permission");
-	if (ret)
-		return ret;
-
-	ret = register_one(&getattr_krp, "vfs_getattr");
-	if (ret)
-		pr_warn("hide_dd: vfs_getattr hook failed, trying nosec\n");
-
-	ret = register_one(&getattr_nosec_krp, "vfs_getattr_nosec");
-	if (ret)
-		pr_warn("hide_dd: vfs_getattr_nosec hook failed\n");
+	register_kret(&perm_krp, "inode_permission");
+	register_kret(&getattr_krp, "vfs_getattr");
 
 	pr_info("hide_dd: loaded (uid %d..%d)\n", APP_UID_MIN, APP_UID_MAX);
 	return 0;
@@ -302,7 +273,6 @@ static int __init hide_dd_init(void)
 
 static void __exit hide_dd_exit(void)
 {
-	unregister_kretprobe(&getattr_nosec_krp);
 	unregister_kretprobe(&getattr_krp);
 	unregister_kretprobe(&perm_krp);
 	pr_info("hide_dd: unloaded\n");
@@ -313,4 +283,4 @@ module_exit(hide_dd_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Hide /data/data/<other_uid> from app processes");
-MODULE_VERSION("3.1");
+MODULE_VERSION("3.4");
