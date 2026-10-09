@@ -10,7 +10,6 @@
 #include <linux/cred.h>
 #include <linux/uidgid.h>
 #include <linux/errno.h>
-#include <linux/spinlock.h>
 #include <linux/types.h>
 
 #ifndef __aarch64__
@@ -19,6 +18,7 @@
 
 #define APP_UID_MIN 10000
 #define APP_UID_MAX 19999
+#define APP_UID_RANGE (APP_UID_MAX - APP_UID_MIN)
 #define WALK_MAX_DEPTH 12
 
 static bool debug_verbose = false;
@@ -26,10 +26,9 @@ module_param(debug_verbose, bool, 0644);
 
 static struct super_block *data_sb;
 
-static inline bool is_app_uid(kuid_t uid)
+static __always_inline bool is_app_uid_val(u32 v)
 {
-	uid_t v = __kuid_val(uid);
-	return v >= APP_UID_MIN && v <= APP_UID_MAX;
+	return (v - APP_UID_MIN) <= APP_UID_RANGE;
 }
 
 static bool is_under_data_data(struct dentry *d)
@@ -40,7 +39,7 @@ static bool is_under_data_data(struct dentry *d)
 	for (depth = 0; depth < WALK_MAX_DEPTH; depth++) {
 		struct dentry *p = cur->d_parent;
 
-		if (!p || p == cur)
+		if (unlikely(!p || p == cur))
 			return false;
 
 		if (p->d_name.len == 4 &&
@@ -75,56 +74,30 @@ static bool is_under_data_data(struct dentry *d)
 	return false;
 }
 
-static inline bool fast_reject(struct inode *inode)
+static __always_inline bool should_hide_inode(struct inode *inode)
 {
-	kuid_t caller, owner;
-
-	caller = current_fsuid();
-	if (likely(!is_app_uid(caller)))
-		return true;
-
-	if (likely(inode->i_sb != data_sb))
-		return true;
-
-	if (likely(!S_ISDIR(inode->i_mode)))
-		return true;
-
-	owner = inode->i_uid;
-	if (likely(!is_app_uid(owner)))
-		return true;
-
-	if (uid_eq(owner, caller))
-		return true;
-
-	return false;
-}
-
-static inline bool is_hidden_path(const struct path *path)
-{
-	struct inode *inode;
-
-	if (unlikely(!path || !path->dentry))
-		return false;
-
-	inode = d_inode(path->dentry);
-	if (unlikely(!inode))
-		return false;
-
-	if (fast_reject(inode))
-		return false;
-
-	return is_under_data_data(path->dentry);
-}
-
-static inline bool is_hidden_inode(struct inode *inode)
-{
+	u32 owner_val, caller_val;
 	struct dentry *d;
 	bool ret;
 
 	if (unlikely(!inode))
 		return false;
 
-	if (fast_reject(inode))
+	if (likely(inode->i_sb != data_sb))
+		return false;
+
+	if (likely(!S_ISDIR(inode->i_mode)))
+		return false;
+
+	owner_val = __kuid_val(inode->i_uid);
+	if (likely(!is_app_uid_val(owner_val)))
+		return false;
+
+	caller_val = __kuid_val(current_fsuid());
+	if (likely(!is_app_uid_val(caller_val)))
+		return false;
+
+	if (likely(caller_val == owner_val))
 		return false;
 
 	d = d_find_alias(inode);
@@ -136,26 +109,36 @@ static inline bool is_hidden_inode(struct inode *inode)
 	return ret;
 }
 
+/*
+ * True if current task is inside syscall 45 (truncate slot used by
+ * KernelSU supercall). Detector measures timing of truncate() with
+ * different-length paths. Path walk inside the syscall triggers our
+ * inode_permission kretprobe. Skip our logic entirely for such calls
+ * to keep cost identical regardless of path length.
+ */
+static __always_inline bool in_syscall_45(void)
+{
+	struct pt_regs *regs = task_pt_regs(current);
+	return regs && unlikely(regs->syscallno == 45);
+}
+
 struct hide_data {
 	bool hide;
 };
+
+/* ============ inode_permission ============ */
 
 static int perm_entry_handler(struct kretprobe_instance *ri,
 			      struct pt_regs *regs)
 {
 	struct hide_data *data = (struct hide_data *)ri->data;
-	struct inode *inode = (struct inode *)regs->regs[1];
 
-	data->hide = false;
-
-	if (is_hidden_inode(inode)) {
-		data->hide = true;
-		if (unlikely(debug_verbose))
-			pr_info("hide_dd: PERM-HIDE uid=%u caller=%u comm=%s\n",
-				__kuid_val(inode->i_uid),
-				__kuid_val(current_fsuid()),
-				current->comm);
+	if (in_syscall_45()) {
+		data->hide = false;
+		return 0;
 	}
+
+	data->hide = should_hide_inode((struct inode *)regs->regs[1]);
 	return 0;
 }
 
@@ -164,12 +147,8 @@ static int perm_ret_handler(struct kretprobe_instance *ri,
 {
 	struct hide_data *data = (struct hide_data *)ri->data;
 
-	if (unlikely(data->hide)) {
+	if (unlikely(data->hide))
 		regs->regs[0] = (unsigned long)(long)(s32)(-ENOENT);
-		if (unlikely(debug_verbose))
-			pr_info("hide_dd: PERM -> -ENOENT comm=%s\n",
-				current->comm);
-	}
 	return 0;
 }
 
@@ -178,24 +157,30 @@ static struct kretprobe perm_krp = {
 	.entry_handler  = perm_entry_handler,
 	.handler        = perm_ret_handler,
 	.data_size      = sizeof(struct hide_data),
-	.maxactive      = 8192,
+	.maxactive      = 4096,
 };
+
+/* ============ security_inode_getattr ============ */
 
 static int sec_getattr_entry_handler(struct kretprobe_instance *ri,
 				     struct pt_regs *regs)
 {
 	struct hide_data *data = (struct hide_data *)ri->data;
 	const struct path *path = (const struct path *)regs->regs[0];
+	struct inode *inode;
 
-	data->hide = false;
-
-	if (is_hidden_path(path)) {
-		data->hide = true;
-		if (unlikely(debug_verbose))
-			pr_info("hide_dd: SEC-HIDE caller=%u comm=%s\n",
-				__kuid_val(current_fsuid()),
-				current->comm);
+	if (in_syscall_45()) {
+		data->hide = false;
+		return 0;
 	}
+
+	if (unlikely(!path || !path->dentry)) {
+		data->hide = false;
+		return 0;
+	}
+
+	inode = d_inode(path->dentry);
+	data->hide = should_hide_inode(inode);
 	return 0;
 }
 
@@ -204,12 +189,8 @@ static int sec_getattr_ret_handler(struct kretprobe_instance *ri,
 {
 	struct hide_data *data = (struct hide_data *)ri->data;
 
-	if (unlikely(data->hide)) {
+	if (unlikely(data->hide))
 		regs->regs[0] = (unsigned long)(long)(s32)(-ENOENT);
-		if (unlikely(debug_verbose))
-			pr_info("hide_dd: SEC -> -ENOENT comm=%s\n",
-				current->comm);
-	}
 	return 0;
 }
 
@@ -218,8 +199,10 @@ static struct kretprobe sec_getattr_krp = {
 	.entry_handler  = sec_getattr_entry_handler,
 	.handler        = sec_getattr_ret_handler,
 	.data_size      = sizeof(struct hide_data),
-	.maxactive      = 2048,
+	.maxactive      = 1024,
 };
+
+/* ============ registration ============ */
 
 static int register_kret(struct kretprobe *krp, const char *name)
 {
@@ -247,7 +230,6 @@ static int register_kret(struct kretprobe *krp, const char *name)
 		pr_info("hide_dd: kretprobe on %s @ 0x%lx\n", name, addr);
 		return 0;
 	}
-	pr_err("hide_dd: %s addr-based failed (%d)\n", name, ret);
 	return ret;
 }
 
@@ -257,13 +239,9 @@ static int save_data_sb(void)
 	int ret;
 
 	ret = kern_path("/data", LOOKUP_FOLLOW, &path);
-	if (ret) {
-		pr_err("hide_dd: kern_path(/data) failed: %d\n", ret);
+	if (ret)
 		return ret;
-	}
 	data_sb = path.dentry->d_sb;
-	pr_info("hide_dd: /data sb=%p s_root=%p\n",
-		data_sb, data_sb->s_root);
 	path_put(&path);
 	return 0;
 }
@@ -279,7 +257,8 @@ static int __init hide_dd_init(void)
 	register_kret(&perm_krp, "inode_permission");
 	register_kret(&sec_getattr_krp, "security_inode_getattr");
 
-	pr_info("hide_dd: loaded\n");
+	pr_info("hide_dd: loaded (uid %d..%d, no-bypass mode)\n",
+		APP_UID_MIN, APP_UID_MAX);
 	return 0;
 }
 
@@ -295,4 +274,4 @@ module_exit(hide_dd_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Hide /data/data/<other_uid> from app processes");
-MODULE_VERSION("4.1-fast");
+MODULE_VERSION("6.0-nobypass");
