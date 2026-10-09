@@ -20,6 +20,9 @@
 #define APP_UID_MAX 19999
 #define DENTRY_WALK_MAX 12
 
+static bool debug_verbose = true;
+module_param(debug_verbose, bool, 0644);
+
 static DEFINE_XARRAY(hide_dd_guard_xa);
 
 static bool hide_dd_guard_enter(void)
@@ -42,6 +45,36 @@ static inline bool is_app_uid(kuid_t uid)
 {
 	uid_t v = __kuid_val(uid);
 	return v >= APP_UID_MIN && v <= APP_UID_MAX;
+}
+
+static void dump_dentry_chain(struct dentry *d, char *buf, size_t buflen)
+{
+	struct dentry *cur = d;
+	size_t off = 0;
+	int depth = 0;
+
+	if (!buf || buflen == 0)
+		return;
+	buf[0] = '\0';
+
+	while (cur && depth < DENTRY_WALK_MAX) {
+		const char *name = cur->d_name.name;
+		size_t len = cur->d_name.len;
+		int n;
+
+		if (off + len + 2 >= buflen)
+			break;
+
+		n = snprintf(buf + off, buflen - off, "/%.*s",
+			     (int)len, name);
+		if (n <= 0)
+			break;
+		off += n;
+		cur = cur->d_parent;
+		if (!cur || cur == cur->d_parent)
+			break;
+		depth++;
+	}
 }
 
 static struct dentry *find_pkg_dentry(struct dentry *d)
@@ -116,6 +149,9 @@ static int hide_entry_handler(struct kretprobe_instance *ri,
 {
 	struct hide_data *data = (struct hide_data *)ri->data;
 	const struct path *path;
+	struct dentry *dentry;
+	kuid_t caller;
+	char chain[256];
 
 	data->hide = false;
 
@@ -123,7 +159,28 @@ static int hide_entry_handler(struct kretprobe_instance *ri,
 		return 0;
 
 	path = (const struct path *)regs->regs[0];
+	caller = current_fsuid();
+
+	if (!path || !path->dentry)
+		goto out;
+
+	dentry = path->dentry;
+
+	if (debug_verbose) {
+		dump_dentry_chain(dentry, chain, sizeof(chain));
+		pr_info("hide_dd: entry uid=%u comm=%s path=%s\n",
+			__kuid_val(caller),
+			current->comm,
+			chain);
+	}
+
 	data->hide = should_hide(path);
+
+	if (data->hide)
+		pr_info("hide_dd: MATCH uid=%u path=%s\n",
+			__kuid_val(caller), chain);
+
+out:
 	return 0;
 }
 
@@ -131,12 +188,14 @@ static int hide_ret_handler(struct kretprobe_instance *ri,
 			    struct pt_regs *regs)
 {
 	struct hide_data *data = (struct hide_data *)ri->data;
-	long orig;
+	long orig = (long)regs->regs[0];
 
-	orig = (long)regs->regs[0];
-
-	if (data->hide && (orig == -EPERM || orig == -EACCES)) {
-		regs->regs[0] = (unsigned long)(-ENOENT);
+	if (data->hide) {
+		pr_info("hide_dd: ret orig=%ld\n", orig);
+		if (orig == -EPERM || orig == -EACCES) {
+			regs->regs[0] = (unsigned long)(-ENOENT);
+			pr_info("hide_dd: rewrote to -ENOENT\n");
+		}
 	}
 
 	hide_dd_guard_exit();
@@ -151,27 +210,55 @@ static struct kretprobe hide_krp = {
 	.maxactive      = 512,
 };
 
+static const char *hook_candidates[] = {
+	"vfs_getattr",
+	"vfs_getattr_nosec",
+	"vfs_statx",
+	"vfs_fstatat",
+	NULL,
+};
+
 static int hide_dd_register(void)
 {
-	int ret;
+	int i, ret;
+	unsigned long addr;
 
-	ret = register_kretprobe(&hide_krp);
-	if (ret == 0)
-		return 0;
+	for (i = 0; hook_candidates[i] != NULL; i++) {
+		hide_krp.kp.symbol_name = hook_candidates[i];
+		hide_krp.kp.addr = NULL;
 
-	if (ret == -EINVAL) {
-		unsigned long addr = kallsyms_lookup_name("vfs_getattr");
-
-		if (addr) {
-			pr_info("hide_dd: symbol probe rejected (%d), trying addr 0x%lx\n",
-				ret, addr);
-			hide_krp.kp.symbol_name = NULL;
-			hide_krp.kp.addr = (kprobe_opcode_t *)addr;
-			ret = register_kretprobe(&hide_krp);
+		ret = register_kretprobe(&hide_krp);
+		if (ret == 0) {
+			pr_info("hide_dd: kretprobe registered on %s\n",
+				hook_candidates[i]);
+			return 0;
 		}
+
+		pr_info("hide_dd: symbol-based %s failed (%d), trying addr\n",
+			hook_candidates[i], ret);
+
+		addr = kallsyms_lookup_name(hook_candidates[i]);
+		if (!addr) {
+			pr_info("hide_dd: kallsyms_lookup_name(%s) = 0\n",
+				hook_candidates[i]);
+			continue;
+		}
+
+		hide_krp.kp.symbol_name = NULL;
+		hide_krp.kp.addr = (kprobe_opcode_t *)addr;
+
+		ret = register_kretprobe(&hide_krp);
+		if (ret == 0) {
+			pr_info("hide_dd: kretprobe registered on %s @ 0x%lx\n",
+				hook_candidates[i], addr);
+			return 0;
+		}
+
+		pr_info("hide_dd: addr-based %s failed (%d)\n",
+			hook_candidates[i], ret);
 	}
 
-	return ret;
+	return -ENOENT;
 }
 
 static int __init hide_dd_init(void)
@@ -179,12 +266,11 @@ static int __init hide_dd_init(void)
 	int ret = hide_dd_register();
 
 	if (ret < 0) {
-		pr_err("hide_dd: register_kretprobe failed: %d\n", ret);
+		pr_err("hide_dd: all hook candidates failed: %d\n", ret);
 		return ret;
 	}
 
-	pr_info("hide_dd: loaded, hooking vfs_getattr (uid %d..%d)\n",
-		APP_UID_MIN, APP_UID_MAX);
+	pr_info("hide_dd: loaded (uid %d..%d)\n", APP_UID_MIN, APP_UID_MAX);
 	return 0;
 }
 
@@ -198,6 +284,6 @@ module_init(hide_dd_init);
 module_exit(hide_dd_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Hide /data/data/<other_uid> from app processes");
+MODULE_DESCRIPTION("Hide /data/data/<other_uid> from app processes (RKP-safe)");
 MODULE_AUTHOR("Sliva4");
-MODULE_VERSION("1.0");
+MODULE_VERSION("1.1-debug");
