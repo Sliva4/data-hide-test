@@ -5,6 +5,7 @@
 #include <linux/fs.h>
 #include <linux/dcache.h>
 #include <linux/path.h>
+#include <linux/namei.h>
 #include <linux/sched.h>
 #include <linux/cred.h>
 #include <linux/uidgid.h>
@@ -18,11 +19,11 @@
 
 #define APP_UID_MIN 10000
 #define APP_UID_MAX 19999
-#define DENTRY_WALK_MAX 16
 
 static bool debug_verbose = true;
 module_param(debug_verbose, bool, 0644);
 
+static struct super_block *data_sb;
 static DEFINE_XARRAY(hide_dd_guard_xa);
 
 static bool hide_dd_guard_enter(void)
@@ -63,61 +64,38 @@ static struct dentry *inode_first_dentry(struct inode *inode)
 	return dentry;
 }
 
-static void log_chain(struct dentry *d, const char *tag)
+static bool is_under_data_data(struct dentry *d)
 {
-	char buf[256];
-	int off = 0;
-	int depth = 0;
+	struct dentry *p, *pp;
 
-	if (!d)
-		return;
+	if (!data_sb || !d)
+		return false;
 
-	while (d && depth < 6) {
-		int n = snprintf(buf + off, sizeof(buf) - off, "/%.*s",
-				 (int)d->d_name.len, d->d_name.name);
-		if (n <= 0)
-			break;
-		off += n;
-		d = d->d_parent;
-		if (!d || d == d->d_parent)
-			break;
-		depth++;
-	}
-	pr_info("hide_dd: %s chain=%s\n", tag, buf);
-}
+	if (d->d_sb != data_sb)
+		return false;
 
-static bool dentry_under_data_data(struct dentry *d)
-{
-	struct dentry *cur = d;
-	int depth = 0;
+	p = d->d_parent;
+	if (!p || p == d)
+		return false;
 
-	while (cur && depth < DENTRY_WALK_MAX) {
-		struct dentry *p  = cur->d_parent;
-		struct dentry *pp;
-
-		if (!p || p == cur)
-			return false;
+	if (p->d_name.len == 4 &&
+	    memcmp(p->d_name.name, "data", 4) == 0) {
 		pp = p->d_parent;
-
-		if (p->d_name.len == 4 &&
-		    memcmp(p->d_name.name, "data", 4) == 0 &&
-		    pp && pp->d_name.len == 4 &&
-		    memcmp(pp->d_name.name, "data", 4) == 0)
+		if (pp && pp == data_sb->s_root)
 			return true;
+	}
 
-		if (p->d_name.len >= 1 &&
-		    p->d_name.name[0] >= '0' && p->d_name.name[0] <= '9' &&
-		    pp && pp->d_name.len == 4 &&
-		    memcmp(pp->d_name.name, "user", 4) == 0) {
-			struct dentry *ppp = pp->d_parent;
-			if (ppp && ppp->d_name.len == 4 &&
-			    memcmp(ppp->d_name.name, "data", 4) == 0)
+	if (p->d_name.len == 1 &&
+	    p->d_name.name[0] >= '0' && p->d_name.name[0] <= '9') {
+		struct dentry *user_d = p->d_parent;
+
+		if (user_d && user_d->d_name.len == 4 &&
+		    memcmp(user_d->d_name.name, "user", 4) == 0) {
+			if (user_d->d_parent == data_sb->s_root)
 				return true;
 		}
-
-		cur = p;
-		depth++;
 	}
+
 	return false;
 }
 
@@ -127,59 +105,33 @@ static bool is_foreign_pkg_dir(struct inode *inode)
 	struct dentry *d;
 	bool ret = false;
 
-	if (!inode) {
-		if (debug_verbose)
-			pr_info("hide_dd: fail: inode=NULL\n");
+	if (!inode)
 		return false;
-	}
 
 	caller = current_fsuid();
-	if (!is_app_uid(caller)) {
-		if (debug_verbose)
-			pr_info("hide_dd: fail: caller=%u not app\n",
-				__kuid_val(caller));
+	if (!is_app_uid(caller))
 		return false;
-	}
 
-	if (!S_ISDIR(inode->i_mode)) {
-		if (debug_verbose)
-			pr_info("hide_dd: fail: mode=0%o not dir\n",
-				inode->i_mode & S_IFMT);
+	if (!S_ISDIR(inode->i_mode))
 		return false;
-	}
 
 	owner = inode->i_uid;
-	if (!is_app_uid(owner)) {
-		if (debug_verbose)
-			pr_info("hide_dd: fail: ino_uid=%u not app\n",
-				__kuid_val(owner));
+	if (!is_app_uid(owner))
 		return false;
-	}
 
-	if (uid_eq(owner, caller)) {
-		if (debug_verbose)
-			pr_info("hide_dd: fail: own dir uid=%u\n",
-				__kuid_val(owner));
+	if (uid_eq(owner, caller))
 		return false;
-	}
-
-	pr_info("hide_dd: CAND caller=%u ino_uid=%u ino=%lu\n",
-		__kuid_val(caller), __kuid_val(owner), inode->i_ino);
 
 	d = inode_first_dentry(inode);
-	if (!d) {
-		pr_info("hide_dd: fail: no dentry\n");
+	if (!d)
 		return false;
-	}
 
-	if (debug_verbose)
-		log_chain(d, "CAND");
-
-	ret = dentry_under_data_data(d);
+	ret = is_under_data_data(d);
 	dput(d);
 
-	if (ret)
-		pr_info("hide_dd: MATCH-DD\n");
+	if (ret && debug_verbose)
+		pr_info("hide_dd: MATCH-DD ino_uid=%u caller=%u\n",
+			__kuid_val(owner), __kuid_val(caller));
 
 	return ret;
 }
@@ -193,7 +145,6 @@ static int perm_entry_handler(struct kretprobe_instance *ri,
 {
 	struct hide_data *data = (struct hide_data *)ri->data;
 	struct inode *inode;
-	int mask;
 
 	data->hide = false;
 
@@ -201,15 +152,12 @@ static int perm_entry_handler(struct kretprobe_instance *ri,
 		return 0;
 
 	inode = (struct inode *)regs->regs[1];
-	mask  = (int)regs->regs[2];
 
 	if (debug_verbose && inode) {
-		pr_info("hide_dd: perm caller=%u ino=%lu ino_uid=%u mode=0%o mask=0x%x comm=%s\n",
+		pr_info("hide_dd: perm caller=%u ino_uid=%u mode=0%o comm=%s\n",
 			__kuid_val(current_fsuid()),
-			inode->i_ino,
 			__kuid_val(inode->i_uid),
 			inode->i_mode & S_IFMT,
-			mask,
 			current->comm);
 	}
 
@@ -231,10 +179,11 @@ static int perm_ret_handler(struct kretprobe_instance *ri,
 	long orig = (long)regs->regs[0];
 
 	if (data->hide) {
-		pr_info("hide_dd: ret orig=%ld\n", orig);
 		if (orig == -EPERM || orig == -EACCES) {
 			regs->regs[0] = (unsigned long)(-ENOENT);
 			pr_info("hide_dd: rewrote %ld -> -ENOENT\n", orig);
+		} else if (debug_verbose) {
+			pr_info("hide_dd: ret orig=%ld (not rewritten)\n", orig);
 		}
 	}
 
@@ -249,6 +198,24 @@ static struct kretprobe perm_krp = {
 	.data_size      = sizeof(struct hide_data),
 	.maxactive      = 512,
 };
+
+static int save_data_sb(void)
+{
+	struct path path;
+	int ret;
+
+	ret = kern_path("/data", LOOKUP_FOLLOW, &path);
+	if (ret) {
+		pr_err("hide_dd: kern_path(/data) failed: %d\n", ret);
+		return ret;
+	}
+
+	data_sb = path.dentry->d_sb;
+	pr_info("hide_dd: /data sb=%p s_root=%p\n",
+		data_sb, data_sb->s_root);
+	path_put(&path);
+	return 0;
+}
 
 static int hide_dd_register(void)
 {
@@ -285,8 +252,13 @@ static int hide_dd_register(void)
 
 static int __init hide_dd_init(void)
 {
-	int ret = hide_dd_register();
+	int ret;
 
+	ret = save_data_sb();
+	if (ret)
+		return ret;
+
+	ret = hide_dd_register();
 	if (ret < 0) {
 		pr_err("hide_dd: register_kretprobe failed: %d\n", ret);
 		return ret;
@@ -307,4 +279,4 @@ module_exit(hide_dd_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Hide /data/data/<other_uid> from app processes");
-MODULE_VERSION("2.2-diag");
+MODULE_VERSION("2.3");
