@@ -40,18 +40,13 @@ KBUILD_ARGS := M=$(MDIR)
 endif
 
 obj-m += hma_uidfake.o
-hma_uidfake-objs := main.o patch.o hooks.o lsm.o netlink.o
+hma_uidfake-objs := main.o
 
 ifeq ($(strip $(LSE_HDR)$(SP_REG)$(KGDB_BRK)),)
 else
-ccflags-y += -include $(MDIR)/include/kmi_compat.h
 endif
 ifneq ($(SP_REG),)
-ccflags-y += -DUIDFAKE_SP_REGISTER
 endif
 ifneq ($(KGDB_BRK),)
-ccflags-y += -DUIDFAKE_KGDB_BRK
 endif
-ccflags-y += -I$(MDIR)/include
-ccflags-y += -I$(MDIR)
 ccflags-y += -gz=none
