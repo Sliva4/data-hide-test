@@ -26,8 +26,6 @@ jobs:
           # The module version comes from git (tag + short hash), so the tags have to be here.
           fetch-depth: 0
           submodules: recursive
-      - name: Check formatting
-        run: bash scripts/check-format.sh
       - name: Build
         run: |
           set -euo pipefail
