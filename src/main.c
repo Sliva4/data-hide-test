@@ -18,6 +18,7 @@
 
 #define APP_UID_MIN 10000
 #define APP_UID_MAX 19999
+#define DENTRY_WALK_MAX 16
 
 static bool debug_verbose = true;
 module_param(debug_verbose, bool, 0644);
@@ -53,11 +54,12 @@ static struct dentry *inode_first_dentry(struct inode *inode)
 	spin_lock(&inode->i_lock);
 	if (!hlist_empty(&inode->i_dentry)) {
 		dentry = hlist_entry(inode->i_dentry.first,
-				     struct dentry, d_alias);
+				     struct dentry, d_u.d_alias);
 		if (dentry)
 			lockref_get_not_dead(&dentry->d_lockref);
 	}
 	spin_unlock(&inode->i_lock);
+
 	return dentry;
 }
 
@@ -66,7 +68,7 @@ static bool dentry_under_data_data(struct dentry *d)
 	struct dentry *cur = d;
 	int depth = 0;
 
-	while (cur && depth < 16) {
+	while (cur && depth < DENTRY_WALK_MAX) {
 		struct dentry *p  = cur->d_parent;
 		struct dentry *pp;
 
@@ -145,7 +147,7 @@ static int perm_entry_handler(struct kretprobe_instance *ri,
 	inode = (struct inode *)regs->regs[1];
 
 	if (debug_verbose && inode) {
-		pr_info("hide_dd: perm uid=%u ino_uid=%u mode=0%o name=%s\n",
+		pr_info("hide_dd: perm caller=%u ino_uid=%u mode=0%o comm=%s\n",
 			__kuid_val(current_fsuid()),
 			__kuid_val(inode->i_uid),
 			inode->i_mode & S_IFMT,
@@ -200,6 +202,8 @@ static int hide_dd_register(void)
 		return 0;
 	}
 
+	pr_info("hide_dd: symbol-based failed (%d), trying addr\n", ret);
+
 	addr = kallsyms_lookup_name("inode_permission");
 	if (!addr) {
 		pr_err("hide_dd: inode_permission not found\n");
@@ -214,6 +218,7 @@ static int hide_dd_register(void)
 		return 0;
 	}
 
+	pr_err("hide_dd: addr-based failed (%d)\n", ret);
 	return ret;
 }
 
@@ -241,4 +246,4 @@ module_exit(hide_dd_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Hide /data/data/<other_uid> from app processes");
-MODULE_VERSION("2.0");
+MODULE_VERSION("2.1");
