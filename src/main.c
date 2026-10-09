@@ -20,7 +20,7 @@
 #define APP_UID_MAX 19999
 #define DENTRY_WALK_MAX 16
 
-static bool debug_verbose = false;
+static bool debug_verbose = true;
 module_param(debug_verbose, bool, 0644);
 
 static DEFINE_XARRAY(hide_dd_guard_xa);
@@ -61,6 +61,29 @@ static struct dentry *inode_first_dentry(struct inode *inode)
 	spin_unlock(&inode->i_lock);
 
 	return dentry;
+}
+
+static void log_chain(struct dentry *d, const char *tag)
+{
+	char buf[256];
+	int off = 0;
+	int depth = 0;
+
+	if (!d)
+		return;
+
+	while (d && depth < 6) {
+		int n = snprintf(buf + off, sizeof(buf) - off, "/%.*s",
+				 (int)d->d_name.len, d->d_name.name);
+		if (n <= 0)
+			break;
+		off += n;
+		d = d->d_parent;
+		if (!d || d == d->d_parent)
+			break;
+		depth++;
+	}
+	pr_info("hide_dd: %s chain=%s\n", tag, buf);
 }
 
 static bool dentry_under_data_data(struct dentry *d)
@@ -104,28 +127,60 @@ static bool is_foreign_pkg_dir(struct inode *inode)
 	struct dentry *d;
 	bool ret = false;
 
-	if (!inode)
+	if (!inode) {
+		if (debug_verbose)
+			pr_info("hide_dd: fail: inode=NULL\n");
 		return false;
+	}
 
 	caller = current_fsuid();
-	if (!is_app_uid(caller))
+	if (!is_app_uid(caller)) {
+		if (debug_verbose)
+			pr_info("hide_dd: fail: caller=%u not app\n",
+				__kuid_val(caller));
 		return false;
+	}
 
-	if (!S_ISDIR(inode->i_mode))
+	if (!S_ISDIR(inode->i_mode)) {
+		if (debug_verbose)
+			pr_info("hide_dd: fail: mode=0%o not dir\n",
+				inode->i_mode & S_IFMT);
 		return false;
+	}
 
 	owner = inode->i_uid;
-	if (!is_app_uid(owner))
+	if (!is_app_uid(owner)) {
+		if (debug_verbose)
+			pr_info("hide_dd: fail: ino_uid=%u not app\n",
+				__kuid_val(owner));
 		return false;
+	}
 
-	if (uid_eq(owner, caller))
+	if (uid_eq(owner, caller)) {
+		if (debug_verbose)
+			pr_info("hide_dd: fail: own dir uid=%u\n",
+				__kuid_val(owner));
 		return false;
+	}
+
+	pr_info("hide_dd: CAND caller=%u ino_uid=%u ino=%lu\n",
+		__kuid_val(caller), __kuid_val(owner), inode->i_ino);
 
 	d = inode_first_dentry(inode);
-	if (d) {
-		ret = dentry_under_data_data(d);
-		dput(d);
+	if (!d) {
+		pr_info("hide_dd: fail: no dentry\n");
+		return false;
 	}
+
+	if (debug_verbose)
+		log_chain(d, "CAND");
+
+	ret = dentry_under_data_data(d);
+	dput(d);
+
+	if (ret)
+		pr_info("hide_dd: MATCH-DD\n");
+
 	return ret;
 }
 
@@ -138,6 +193,7 @@ static int perm_entry_handler(struct kretprobe_instance *ri,
 {
 	struct hide_data *data = (struct hide_data *)ri->data;
 	struct inode *inode;
+	int mask;
 
 	data->hide = false;
 
@@ -145,12 +201,15 @@ static int perm_entry_handler(struct kretprobe_instance *ri,
 		return 0;
 
 	inode = (struct inode *)regs->regs[1];
+	mask  = (int)regs->regs[2];
 
 	if (debug_verbose && inode) {
-		pr_info("hide_dd: perm caller=%u ino_uid=%u mode=0%o comm=%s\n",
+		pr_info("hide_dd: perm caller=%u ino=%lu ino_uid=%u mode=0%o mask=0x%x comm=%s\n",
 			__kuid_val(current_fsuid()),
+			inode->i_ino,
 			__kuid_val(inode->i_uid),
 			inode->i_mode & S_IFMT,
+			mask,
 			current->comm);
 	}
 
@@ -171,10 +230,12 @@ static int perm_ret_handler(struct kretprobe_instance *ri,
 	struct hide_data *data = (struct hide_data *)ri->data;
 	long orig = (long)regs->regs[0];
 
-	if (data->hide && (orig == -EPERM || orig == -EACCES)) {
-		regs->regs[0] = (unsigned long)(-ENOENT);
-		if (debug_verbose)
+	if (data->hide) {
+		pr_info("hide_dd: ret orig=%ld\n", orig);
+		if (orig == -EPERM || orig == -EACCES) {
+			regs->regs[0] = (unsigned long)(-ENOENT);
 			pr_info("hide_dd: rewrote %ld -> -ENOENT\n", orig);
+		}
 	}
 
 	hide_dd_guard_exit();
@@ -246,4 +307,4 @@ module_exit(hide_dd_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_DESCRIPTION("Hide /data/data/<other_uid> from app processes");
-MODULE_VERSION("2.1");
+MODULE_VERSION("2.2-diag");
