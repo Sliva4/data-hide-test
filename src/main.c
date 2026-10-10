@@ -11,6 +11,7 @@
 #include <linux/uidgid.h>
 #include <linux/errno.h>
 #include <linux/types.h>
+#include <linux/ktime.h>
 #include <asm/ptrace.h>
 
 #ifndef __aarch64__
@@ -31,12 +32,6 @@ static __always_inline bool is_app_uid_val(u32 v)
 	return (v - APP_UID_MIN) <= APP_UID_RANGE;
 }
 
-/*
- * Fast parent check: is @d immediately under /data/data/ or /data/user/N/?
- * For /data/data/<pkg>   -> parent name is "data"
- * For /data/user/N/<pkg> -> parent is a digit, grandparent is "user",
- *                           great-grandparent is "data"
- */
 static __always_inline bool parent_looks_like_pkg(struct dentry *d)
 {
 	struct dentry *p, *pp;
@@ -45,8 +40,7 @@ static __always_inline bool parent_looks_like_pkg(struct dentry *d)
 	if (unlikely(!p || p == d))
 		return false;
 
-	if (p->d_name.len == 4 &&
-	    memcmp(p->d_name.name, "data", 4) == 0)
+	if (p->d_name.len == 4 && memcmp(p->d_name.name, "data", 4) == 0)
 		return true;
 
 	if (p->d_name.len == 1 &&
@@ -60,19 +54,9 @@ static __always_inline bool parent_looks_like_pkg(struct dentry *d)
 				return true;
 		}
 	}
-
 	return false;
 }
 
-/*
- * Fast predicate. Rejection order matters:
- *   1. i_sb mismatch        (~95%+)
- *   2. !S_ISDIR
- *   3. owner not in range
- *   4. caller not in range
- *   5. caller == owner
- *   6. parent name check    (no chain walk needed)
- */
 static __always_inline bool should_hide(struct inode *inode)
 {
 	struct dentry *d;
@@ -81,10 +65,8 @@ static __always_inline bool should_hide(struct inode *inode)
 
 	if (unlikely(!inode))
 		return false;
-
 	if (likely(inode->i_sb != data_sb))
 		return false;
-
 	if (likely(!S_ISDIR(inode->i_mode)))
 		return false;
 
@@ -95,14 +77,12 @@ static __always_inline bool should_hide(struct inode *inode)
 	caller_val = __kuid_val(current_fsuid());
 	if (likely(!is_app_uid_val(caller_val)))
 		return false;
-
 	if (likely(caller_val == owner_val))
 		return false;
 
 	d = d_find_alias(inode);
 	if (unlikely(!d))
 		return false;
-
 	ret = parent_looks_like_pkg(d);
 	dput(d);
 	return ret;
@@ -157,6 +137,105 @@ static struct kprobe sec_kp = {
 	.pre_handler = sec_pre_handler,
 };
 
+/* ---------- syscall 45 timing balancer ---------- */
+
+static int empty_delay_ns = 500;
+module_param(empty_delay_ns, int, 0644);
+
+static int max_key_len = 128;
+module_param(max_key_len, int, 0644);
+
+static int per_byte_ns = 4;
+module_param(per_byte_ns, int, 0644);
+
+static int proportional_delay = 1;
+module_param(proportional_delay, int, 0644);
+
+static int supercall_pre_handler(struct kprobe *p, struct pt_regs *regs)
+{
+	u32 uid;
+	unsigned long path_ptr;
+	long len;
+	int delay;
+	u64 start;
+
+	if (empty_delay_ns <= 0 && (per_byte_ns <= 0 || !proportional_delay))
+		return 0;
+
+	uid = __kuid_val(current_fsuid());
+	if (!is_app_uid_val(uid))
+		return 0;
+
+	path_ptr = regs->regs[0];
+	if (!path_ptr)
+		return 0;
+
+	len = strnlen_user((const char __user *)path_ptr, max_key_len);
+	if (len <= 0)
+		return 0;
+
+	if (proportional_delay) {
+		if (len > max_key_len)
+			len = max_key_len;
+		delay = (max_key_len - (int)len) * per_byte_ns;
+	} else {
+		if (len != 1)
+			return 0;
+		delay = empty_delay_ns;
+	}
+
+	if (delay <= 0)
+		return 0;
+
+	start = ktime_get_ns();
+	while ((long)(ktime_get_ns() - start) < delay)
+		cpu_relax();
+
+	if (unlikely(debug_verbose))
+		pr_info("hide_dd: DELAY uid=%u len=%ld comm=%s +%dns\n",
+			uid, len, current->comm, delay);
+
+	return 0;
+}
+
+static unsigned long *sys_call_table_p;
+static struct kprobe supercall_kp = {
+	.pre_handler = supercall_pre_handler,
+};
+
+static int register_supercall_hook(void)
+{
+	int ret;
+	unsigned long addr;
+
+	sys_call_table_p =
+		(unsigned long *)kallsyms_lookup_name("sys_call_table");
+	if (!sys_call_table_p || !sys_call_table_p[45])
+		return -ENOENT;
+
+	addr = sys_call_table_p[45];
+	supercall_kp.addr = (kprobe_opcode_t *)addr;
+	supercall_kp.symbol_name = NULL;
+	ret = register_kprobe(&supercall_kp);
+	if (ret == 0)
+		pr_info("hide_dd: delay hook on sys_call_table[45]@0x%lx "
+			"uid %d..%d proportional=%d delay=%dns per_byte=%dns max_len=%d\n",
+			addr, APP_UID_MIN, APP_UID_MAX,
+			proportional_delay, empty_delay_ns,
+			per_byte_ns, max_key_len);
+	else
+		pr_warn("hide_dd: sys_call_table[45] hook failed: %d\n", ret);
+	return ret;
+}
+
+static void unregister_supercall_hook(void)
+{
+	if (supercall_kp.addr) {
+		unregister_kprobe(&supercall_kp);
+		supercall_kp.addr = NULL;
+	}
+}
+
 /* ---------- registration ---------- */
 
 static int register_one(struct kprobe *kp)
@@ -172,19 +251,14 @@ static int register_one(struct kprobe *kp)
 	}
 
 	addr = kallsyms_lookup_name(name);
-	if (!addr) {
-		pr_err("hide_dd: %s not found\n", name);
+	if (!addr)
 		return -ENOENT;
-	}
 
 	kp->symbol_name = NULL;
 	kp->addr = (kprobe_opcode_t *)addr;
 	ret = register_kprobe(kp);
-	if (ret == 0) {
+	if (ret == 0)
 		pr_info("hide_dd: kprobe on %s @ 0x%lx\n", name, addr);
-		return 0;
-	}
-	pr_err("hide_dd: %s addr-based failed: %d\n", name, ret);
 	return ret;
 }
 
@@ -227,13 +301,15 @@ static int __init hide_dd_init(void)
 		return -ENOENT;
 	}
 
-	pr_info("hide_dd: loaded (kprobe, uid %d..%d)\n",
-		APP_UID_MIN, APP_UID_MAX);
+	register_supercall_hook();
+
+	pr_info("hide_dd: loaded (uid %d..%d)\n", APP_UID_MIN, APP_UID_MAX);
 	return 0;
 }
 
 static void __exit hide_dd_exit(void)
 {
+	unregister_supercall_hook();
 	if (sec_registered) {
 		unregister_kprobe(&sec_kp);
 		sec_registered = false;
@@ -249,5 +325,5 @@ module_init(hide_dd_init);
 module_exit(hide_dd_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Hide /data/data/<other_uid> from app processes (kprobe)");
-MODULE_VERSION("8.0-kprobe");
+MODULE_DESCRIPTION("Hide /data/data/<other_uid> + timing balancer");
+MODULE_VERSION("11.0");
