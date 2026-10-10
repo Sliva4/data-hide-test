@@ -71,7 +71,7 @@ static __always_inline bool should_hide_any(struct inode *inode)
 	instruction_pointer_set(regs, regs->regs[30]); \
 } while (0)
 
-/* ============ inode_permission ============ */
+/* ============ 1. inode_permission ============ */
 static int perm_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
 	struct inode *inode = (struct inode *)regs->regs[1];
@@ -88,7 +88,7 @@ static struct kprobe perm_kp = {
 	.pre_handler = perm_pre_handler,
 };
 
-/* ============ security_inode_getattr ============ */
+/* ============ 2. security_inode_getattr ============ */
 static int sec_getattr_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
 	const struct path *path = (const struct path *)regs->regs[0];
@@ -108,7 +108,7 @@ static struct kprobe sec_getattr_kp = {
 	.pre_handler = sec_getattr_pre_handler,
 };
 
-/* ============ vfs_open ============ */
+/* ============ 3. vfs_open ============ */
 static int vfs_open_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
 	const struct path *path = (const struct path *)regs->regs[0];
@@ -128,10 +128,14 @@ static struct kprobe vfs_open_kp = {
 	.pre_handler = vfs_open_pre_handler,
 };
 
-/* ============ security_inode_getxattr ============ */
-static int sec_getxattr_pre_handler(struct kprobe *p, struct pt_regs *regs)
+/* ============ 4. vfs_getxattr ============ */
+/* 5.15: int vfs_getxattr(struct user_namespace *mnt_userns, struct dentry *dentry,
+ *                        const char *name, void *value, size_t size)
+ * x0=userns, x1=dentry
+ */
+static int vfs_getxattr_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
-	struct dentry *dentry = (struct dentry *)regs->regs[0];
+	struct dentry *dentry = (struct dentry *)regs->regs[1];
 	struct inode *inode;
 	if (unlikely(!dentry)) return 0;
 	inode = d_inode(dentry);
@@ -143,13 +147,16 @@ static int sec_getxattr_pre_handler(struct kprobe *p, struct pt_regs *regs)
 	}
 	return 0;
 }
-static struct kprobe sec_getxattr_kp = {
-	.symbol_name = "security_inode_getxattr",
-	.pre_handler = sec_getxattr_pre_handler,
+static struct kprobe vfs_getxattr_kp = {
+	.symbol_name = "vfs_getxattr",
+	.pre_handler = vfs_getxattr_pre_handler,
 };
 
-/* ============ security_inode_listxattr ============ */
-static int sec_listxattr_pre_handler(struct kprobe *p, struct pt_regs *regs)
+/* ============ 5. vfs_listxattr ============ */
+/* 5.15: ssize_t vfs_listxattr(struct dentry *dentry, char *list, size_t size)
+ * x0=dentry
+ */
+static int vfs_listxattr_pre_handler(struct kprobe *p, struct pt_regs *regs)
 {
 	struct dentry *dentry = (struct dentry *)regs->regs[0];
 	struct inode *inode;
@@ -163,60 +170,9 @@ static int sec_listxattr_pre_handler(struct kprobe *p, struct pt_regs *regs)
 	}
 	return 0;
 }
-static struct kprobe sec_listxattr_kp = {
-	.symbol_name = "security_inode_listxattr",
-	.pre_handler = sec_listxattr_pre_handler,
-};
-
-/* ============ security_inode_setattr (chmod/chown/utimes) ============ */
-/*
- * On 5.15:  int security_inode_setattr(struct user_namespace *mnt_userns,
- *                                      struct dentry *dentry,
- *                                      struct iattr *attr)
- * x0 = mnt_userns, x1 = dentry, x2 = attr
- */
-static int sec_setattr_pre_handler(struct kprobe *p, struct pt_regs *regs)
-{
-	struct dentry *dentry = (struct dentry *)regs->regs[1];
-	struct inode *inode;
-	if (unlikely(!dentry)) return 0;
-	inode = d_inode(dentry);
-	if (should_hide_any(inode)) {
-		DENY_AND_SKIP(regs);
-		if (unlikely(debug_verbose))
-			pr_info("hide_dd: SETATTR uid=%u\n", __kuid_val(inode->i_uid));
-		return 1;
-	}
-	return 0;
-}
-static struct kprobe sec_setattr_kp = {
-	.symbol_name = "security_inode_setattr",
-	.pre_handler = sec_setattr_pre_handler,
-};
-
-/* ============ security_path_mkdir ============ */
-/*
- * int security_path_mkdir(const struct path *dir, struct dentry *dentry,
- *                         umode_t mode)
- * x0 = dir path, x1 = dentry, x2 = mode
- */
-static int sec_mkdir_pre_handler(struct kprobe *p, struct pt_regs *regs)
-{
-	struct dentry *dentry = (struct dentry *)regs->regs[1];
-	struct inode *inode;
-	if (unlikely(!dentry)) return 0;
-	inode = d_inode(dentry);
-	if (should_hide_any(inode)) {
-		DENY_AND_SKIP(regs);
-		if (unlikely(debug_verbose))
-			pr_info("hide_dd: MKDIR uid=%u\n", __kuid_val(inode->i_uid));
-		return 1;
-	}
-	return 0;
-}
-static struct kprobe sec_mkdir_kp = {
-	.symbol_name = "security_path_mkdir",
-	.pre_handler = sec_mkdir_pre_handler,
+static struct kprobe vfs_listxattr_kp = {
+	.symbol_name = "vfs_listxattr",
+	.pre_handler = vfs_listxattr_pre_handler,
 };
 
 /* ============ registration ============ */
@@ -267,10 +223,8 @@ static int __init hide_dd_init(void)
 	register_one(&perm_kp);
 	register_one(&sec_getattr_kp);
 	register_one(&vfs_open_kp);
-	register_one(&sec_getxattr_kp);
-	register_one(&sec_listxattr_kp);
-	register_one(&sec_setattr_kp);
-	register_one(&sec_mkdir_kp);
+	register_one(&vfs_getxattr_kp);
+	register_one(&vfs_listxattr_kp);
 
 	pr_info("hide_dd: loaded (uid %d..%d)\n", APP_UID_MIN, APP_UID_MAX);
 	return 0;
@@ -278,13 +232,11 @@ static int __init hide_dd_init(void)
 
 static void __exit hide_dd_exit(void)
 {
-	if (sec_mkdir_kp.addr)        unregister_kprobe(&sec_mkdir_kp);
-	if (sec_setattr_kp.addr)      unregister_kprobe(&sec_setattr_kp);
-	if (sec_listxattr_kp.addr)    unregister_kprobe(&sec_listxattr_kp);
-	if (sec_getxattr_kp.addr)     unregister_kprobe(&sec_getxattr_kp);
-	if (vfs_open_kp.addr)         unregister_kprobe(&vfs_open_kp);
-	if (sec_getattr_kp.addr)      unregister_kprobe(&sec_getattr_kp);
-	if (perm_kp.addr)             unregister_kprobe(&perm_kp);
+	if (vfs_listxattr_kp.addr)  unregister_kprobe(&vfs_listxattr_kp);
+	if (vfs_getxattr_kp.addr)   unregister_kprobe(&vfs_getxattr_kp);
+	if (vfs_open_kp.addr)       unregister_kprobe(&vfs_open_kp);
+	if (sec_getattr_kp.addr)    unregister_kprobe(&sec_getattr_kp);
+	if (perm_kp.addr)           unregister_kprobe(&perm_kp);
 	pr_info("hide_dd: unloaded\n");
 }
 
@@ -292,5 +244,5 @@ module_init(hide_dd_init);
 module_exit(hide_dd_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Hide app data of other UIDs from app processes");
-MODULE_VERSION("14.0");
+MODULE_DESCRIPTION("Hide app data of other UIDs (safe subset)");
+MODULE_VERSION("15.0");
